@@ -281,6 +281,7 @@ static int read_int_procfile(char* filename, uint64_t* out) {
 }
 
 static uint64_t tpc_mask_per_gpc_per_dev[16][12];
+// Output mask is vtpc-indexed (virtual TPC)
 int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev) {
 	uint32_t i, j, vtpc_idx = 0;
 	uint64_t gpc_mask, num_tpc_per_gpc, max_gpcs, gpc_tpc_mask;
@@ -322,7 +323,7 @@ int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, 
 				// Skip disabled TPCs
 				if ((1 << j) & gpc_tpc_mask)
 					continue;
-				*tpc_mask |= (1 << vtpc_idx);
+				*tpc_mask |= (1ull << vtpc_idx);
 				vtpc_idx++;
 		}
 	}

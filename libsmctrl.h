@@ -55,6 +55,9 @@ extern int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev);
 // Get number of GPCs for devices number `dev`, and a GPC-indexed array
 // containing masks of which TPCs are associated with each GPC.
 // Note that the `nvdebug` module must be loaded to use this function.
+// @param  num_enabled_gpcs Location to store number of GPCs in
+// @param  tpcs_for_gpc     Pointer to store pointer to output buffer at
+// @return 0 on success, error code on error
 extern int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev);
 
 #ifdef __cplusplus
