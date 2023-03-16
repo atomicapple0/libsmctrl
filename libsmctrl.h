@@ -50,15 +50,21 @@ extern void set_sm_mask(uint64_t mask) __attribute__((deprecated("Use libsmctrl_
 
 /* INFORMATIONAL FUNCTIONS */
 
-// Get total number of TPCs on device number `dev`.
-extern int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev);
 // Get number of GPCs for devices number `dev`, and a GPC-indexed array
 // containing masks of which TPCs are associated with each GPC.
 // Note that the `nvdebug` module must be loaded to use this function.
-// @param  num_enabled_gpcs Location to store number of GPCs in
-// @param  tpcs_for_gpc     Pointer to store pointer to output buffer at
-// @return 0 on success, error code on error
+// @param  num_enabled_gpcs (out) Location to store number of GPCs in
+// @param  tpcs_for_gpc     (out) Pointer to store pointer to output buffer at
+// @param  dev               (in) `nvdebug` device ID
+// @return 0 on success, `errno`-compatible error code on failure
 extern int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev);
+// Get total number of TPCs on device number `dev`. Requires `nvdebug`.
+// @param  num_tpcs        (out) Location to store number of TPCs at
+// @param  dev              (in) `nvdebug` device ID
+// @return 0 on success, `errno`-compatible error code on failure
+extern int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev);
+// Identical to above, but for a CUDA device ID. Does not require `nvdebug`.
+extern int libsmctrl_get_tpc_info_cuda(uint32_t* num_tpcs, int cuda_dev);
 
 #ifdef __cplusplus
 }

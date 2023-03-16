@@ -2,3 +2,4 @@ libsmctrl.a
 libsmctrl.o
 libsmctrl.so
 libsmctrl_test_gpc_info
+*.pyc

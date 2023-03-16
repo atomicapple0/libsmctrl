@@ -226,13 +226,15 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_12_0_MASK_OFF);
 		break;
 	default: {
-		// For experimenting to determine the right mask offset, set MASK_OFF (positive and negative numbers supported)
+		// For experimenting to determine the right mask offset, set the MASK_OFF
+		// environment variable (positive and negative numbers are supported)
 		char* mask_off_str = getenv("MASK_OFF");
 		fprintf(stderr, "libsmctrl: Stream masking unsupported on this CUDA version (%d)!\n", ver);
 		if (mask_off_str) {
 			int off = atoi(mask_off_str);
-			fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA 11.8 base %#x (total off: %#x)\n", off, CU_11_8_MASK_OFF, CU_11_8_MASK_OFF+off);
-			hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_11_8_MASK_OFF + off);
+			fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA 12.1 base %#x "
+					"(total off: %#x)\n", off, CU_12_0_MASK_OFF, CU_12_0_MASK_OFF+off);
+			hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_12_0_MASK_OFF + off);
 		} else {
 			return;
 		}}
@@ -242,44 +244,21 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 	hw_mask->lower = mask;
 }
 
-int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev) {
-	int num_sms;
-	int major;
-	int minor;
-	// TODO: Use nvdebug instead of this hardcoded hack
-	cuDeviceGetAttribute(&num_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
-	cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
-	cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
-	// SM masking only works on sm_35+
-	if (major < 3 || (major == 3 && minor < 5))
-		return -ENOTSUP;
-	// Everything newer than Pascal (as of Hopper) has 2 SMs per TPC, as well
-	// as the P100, which is uniquely sm_60
-	int sms_per_tpc;
-	if (major > 6 || (major == 6 && minor == 0))
-		sms_per_tpc = 2;
-	else
-		sms_per_tpc = 1;
-	// It looks like there may be some upcoming weirdness (TPCs with only one SM?)
-	// with Hopper
-	if (major >= 9)
-		fprintf(stderr, "libsmctrl: WARNING, SM masking is untested on Hopper, and will likely yield incorrect results! Proceed with caution.\n");
-	*num_tpcs = num_sms/sms_per_tpc;
-	return 0;
-}
+/* INFORMATIONAL FUNCTIONS */
 
 // Read an integer from a file in `/proc`
 static int read_int_procfile(char* filename, uint64_t* out) {
 	char f_data[18] = {0};
 	int fd = open(filename, O_RDONLY);
 	if (fd == -1)
-		return -errno;
+		return errno;
 	read(fd, f_data, 18);
 	close(fd);
 	*out = strtoll(f_data, NULL, 16);
 	return 0;
 }
 
+// We support up to 12 GPCs per GPU, and up to 16 GPUs.
 static uint64_t tpc_mask_per_gpc_per_dev[16][12];
 // Output mask is vtpc-indexed (virtual TPC)
 int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev) {
@@ -291,13 +270,14 @@ int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, 
 	// Maximum number of GPCs supported for this chip
 	snprintf(filename, 100, "/proc/gpu%d/num_gpcs", dev);
 	if (err = read_int_procfile(filename, &max_gpcs)) {
-		fprintf(stderr, "libsmctrl: nvdebug module must be loaded into kernel before using libsmctrl_get_gpc_info()\n");
+		fprintf(stderr, "libsmctrl: nvdebug module must be loaded into kernel before "
+				"using libsmctrl_get_*_info() functions\n");
 		return err;
 	}
 	// TODO: handle arbitrary-size GPUs
 	if (dev > 16 || max_gpcs > 12) {
 		fprintf(stderr, "libsmctrl: GPU possibly too large for preallocated map!\n");
-		return -ERANGE;
+		return ERANGE;
 	}
 	// Set bit = disabled GPC
 	snprintf(filename, 100, "/proc/gpu%d/gpc_mask", dev);
@@ -329,5 +309,54 @@ int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, 
 	}
 	*tpcs_for_gpc = tpc_mask_per_gpc_per_dev[dev];
 	return 0;
+}
+
+int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev) {
+	uint32_t num_gpcs;
+	uint64_t* tpcs_per_gpc;
+	int res;
+	if (res = libsmctrl_get_gpc_info(&num_gpcs, &tpcs_per_gpc, dev))
+		return res;
+	*num_tpcs = 0;
+	for (int gpc = 0; gpc < num_gpcs; gpc++) {
+		*num_tpcs += __builtin_popcountl(tpcs_per_gpc[gpc]);
+	}
+	return 0;
+}
+
+// @param dev Device index as understood by CUDA **can differ from nvdebug idx**
+// This implementation is fragile, and could be incorrect for odd GPUs
+int libsmctrl_get_tpc_info_cuda(uint32_t* num_tpcs, int cuda_dev) {
+	int num_sms, major, minor, res = 0;
+	const char* err_str;
+	if (res = cuInit(0))
+		goto abort_cuda;
+	if (res = cuDeviceGetAttribute(&num_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_dev))
+		goto abort_cuda;
+	if (res = cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuda_dev))
+		goto abort_cuda;
+	if (res = cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuda_dev))
+		goto abort_cuda;
+	// SM masking only works on sm_35+
+	if (major < 3 || (major == 3 && minor < 5))
+		return ENOTSUP;
+	// Everything newer than Pascal (as of Hopper) has 2 SMs per TPC, as well
+	// as the P100, which is uniquely sm_60
+	int sms_per_tpc;
+	if (major > 6 || (major == 6 && minor == 0))
+		sms_per_tpc = 2;
+	else
+		sms_per_tpc = 1;
+	// It looks like there may be some upcoming weirdness (TPCs with only one SM?)
+	// with Hopper
+	if (major >= 9)
+		fprintf(stderr, "libsmctrl: WARNING, TPC masking is untested on Hopper,"
+				" and will likely yield incorrect results! Proceed with caution.\n");
+	*num_tpcs = num_sms/sms_per_tpc;
+	return 0;
+abort_cuda:
+	cuGetErrorName(res, &err_str);
+	fprintf(stderr, "libsmctrl: CUDA call failed due to %s. Failing with EIO...\n", err_str);
+	return EIO;
 }
 
