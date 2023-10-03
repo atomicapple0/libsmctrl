@@ -223,6 +223,7 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 		break;
 	case 12000:
 	case 12010:
+	case 12020:
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_12_0_MASK_OFF);
 		break;
 	default: {
