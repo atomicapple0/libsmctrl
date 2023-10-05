@@ -1,21 +1,15 @@
 /**
- * Copyright 2022 Joshua Bakita
+ * Copyright 2023 Joshua Bakita
  * Library to control SM masks on CUDA launches. Co-opts preexisting debug
  * logic in the CUDA driver library, and thus requires a build with -lcuda.
  */
-
-//#include "/playpen/playpen/cuda-11.8/include/cuda.h"
 #include <cuda.h>
-//#include <cuda_runtime.h>
-//#ifndef CUDA_VERSION
-//#warning libsmctrl: CUDA driver library must be included before libsmctrl.h.
-//#endif
 
-#include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
 
 // Layout of mask control fields in CUDA's `globals` struct
 struct global_sm_control {
@@ -65,7 +59,7 @@ static void setup_sm_control_10() {
 
 /*** QMD/TMD-based SM Mask Control via Debug Callback. CUDA 11+ ***/
 
-// Tested working on CUDA x86_64 11.0-11.8.
+// Tested working on CUDA x86_64 11.0-12.2.
 // Tested not working on aarch64 or x86_64 10.2
 static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b};
 #define LAUNCH_DOMAIN 0x3
@@ -141,10 +135,6 @@ void libsmctrl_set_global_mask(uint64_t mask) {
 	}
 }
 
-void set_sm_mask(uint64_t mask) {
-	libsmctrl_set_global_mask(mask);
-}
-
 // Set mask for next launch from this thread
 void libsmctrl_set_next_mask(uint64_t mask) {
 	if (!sm_control_setup_called)
@@ -157,6 +147,7 @@ void libsmctrl_set_next_mask(uint64_t mask) {
 
 #define CU_8_0_MASK_OFF 0xec
 #define CU_9_0_MASK_OFF 0x130
+#define CU_9_0_MASK_OFF_TX2 0x128 // CUDA 9.0 is slightly different on the TX2
 // CUDA 9.0 and 9.1 use the same offset
 #define CU_9_2_MASK_OFF 0x140
 #define CU_10_0_MASK_OFF 0x24c
@@ -177,7 +168,35 @@ struct stream_sm_mask {
 	uint32_t lower;
 } __attribute__((packed));
 
-// Should work for CUDA 9.1, 10.0-11.8, 12.0-12.1
+// Check if this system has a Parker SoC (TX2/PX2 chip)
+// (CUDA 9.0 behaves slightly different on this platform.)
+// @return 1 if detected, 0 if not, -cuda_err on error
+#if __aarch64__
+int detect_parker_soc() {
+	int cap_major, cap_minor, err, dev_count;
+	if (err = cuDeviceGetCount(&dev_count))
+		return -err;
+	// As CUDA devices are numbered by order of compute power, check every
+	// device, in case a powerful discrete GPU is attached (such as on the
+	// DRIVE PX2). We detect the Parker SoC via its unique CUDA compute
+	// capability: 6.2.
+	for (int i = 0; i < dev_count; i++) {
+		if (err = cuDeviceGetAttribute(&cap_minor,
+		                               CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+		                               i))
+			return -err;
+		if (err = cuDeviceGetAttribute(&cap_major,
+		                               CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+		                               i))
+			return -err;
+		if (cap_major == 6 && cap_minor == 2)
+			return 1;
+	}
+	return 0;
+}
+#endif // __aarch64__
+
+// Should work for CUDA 8.0 through 12.1
 // A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
 // our header
 void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
@@ -189,9 +208,26 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 	case 8000:
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_8_0_MASK_OFF);
 	case 9000:
-	case 9010:
+	case 9010: {
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_0_MASK_OFF);
+#if __aarch64__
+		// Jetson TX2 offset is slightly different on CUDA 9.0.
+		// Only compile the check into ARM64 builds.
+		int is_parker;
+		const char* err_str;
+		if ((is_parker = detect_parker_soc()) < 0) {
+			cuGetErrorName(-is_parker, &err_str);
+			fprintf(stderr, "libsmctrl_set_stream_mask: CUDA call "
+					"failed while doing compatibilty test."
+			                "Error, '%s'. Not applying stream "
+					"mask.\n", err_str);
+		}
+
+		if (is_parker)
+			hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_0_MASK_OFF_TX2);
+#endif
 		break;
+	}
 	case 9020:
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_2_MASK_OFF);
 		break;
