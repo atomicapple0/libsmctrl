@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 /* PARTITIONING FUNCTIONS */
 
 // Set global default TPC mask for all kernels, incl. CUDA-internal ones
