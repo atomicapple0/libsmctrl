@@ -6,12 +6,18 @@
 #include <cuda.h>
 
 #include <errno.h>
+#include <error.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 
-// Layout of mask control fields in CUDA's `globals` struct
+// In functions that do not return an error code, we favor terminating with an
+// error rather than merely printing a warning and continuing.
+#define abort(ret, errno, ...) error_at_line(ret, errno, __FILE__, __LINE__, \
+                                             __VA_ARGS__)
+
+// Layout of mask control fields to match CUDA's static global struct
 struct global_sm_control {
 	uint32_t enabled;
 	uint64_t mask;
@@ -19,42 +25,100 @@ struct global_sm_control {
 
 /*** CUDA Globals Manipulation. CUDA 10.2 only ***/
 
-// Ends up being 0x7fb7fa3408 in some binaries
+// Ends up being 0x7fb7fa3408 in some binaries (CUDA 10.2, Jetson)
 static struct global_sm_control* g_sm_control = NULL;
 
 /* Find the location of CUDA's `globals` struct and the SM mask control fields
  * No symbols are exported from within `globals`, so this has to do a very
  * messy lookup, following the pattern of the assembly of `cuDeviceGetCount()`.
- * Don't call this before the cuda library has been initialized.
+ * Don't call this before the CUDA library has been initialized.
+ * (Note that this appears to work, even if built on CUDA > 10.2.)
  */
-static void setup_sm_control_10() {
+static void setup_g_sm_control_10() {
 	if (g_sm_control)
 		return;
-	// Defeat relocation. cudbgReportDriverApiErrorFlags is relocated by
-	// the loader, but not subject to ASLR (it's always at a constant
-	// offset in the loaded instance of libcuda.so). Our target is also at
-	// a constant offset, so we can use the address of
-	// cudbgReportDriverApiErrorFlags as a reference point.
-	// Note: cudbgReportDriverApiErrorFlags is currently the closest known
-	// symbol to **the table**. cudbgDebuggerInitialized is the closest to
-	// globals itself (+7424 == SM mask control), but we perfer the table
-	// lookup approach for now, as that's what cuDeviceGetCount() does.
+	// The location of the static global struct containing the global SM
+	// mask field will vary depending on where the loader locates the CUDA
+	// library. In order to reliably modify this struct, we must defeat
+	// that relocation by deriving its location relative to a known
+	// reference point.
+	//
+	// == Choosing a Reference Point:
+	// The cudbg* symbols appear to be relocated to a constant offset from
+	// the globals structure, and so we use the address of the symbol
+	// `cudbgReportDriverApiErrorFlags` as our reference point. (This ends
+	// up being the closest to an intermediate table we use as part of our
+	// lookup---process discussed below.)
 	extern uint32_t cudbgReportDriverApiErrorFlags;
-	uint32_t* sym = 0;//&cudbgReportDriverApiErrorFlags;
-	// In some binaries, the following works out to 0x7fb7ea6000, and
-	// that's what shows up in the adrp instruction in cuDeviceGetCount()
-	// in the lead-up to get globals.numDevices. Find this offset by
-	// calling cuDeviceGetCount(0xdeadbeef), catching the segfault in GDB,
-	// disassembling the prior instructions, taking the adrp constant, and
-	// subtracting the address of cudbgReportDriverApiErrorFlags from it.
+	uint32_t* sym = &cudbgReportDriverApiErrorFlags;
+
+	// == Deriving Location:
+	// The number of CUDA devices available is co-located in the same CUDA
+	// globals structure that we aim to modify the SM mask field in. The
+	// value in that field can be assigned to a user-controlled pointer via
+	// the cuDeviceGetCount() CUDA Driver Library function. To determine
+	// the location of thu structure, we pass a bad address to the function
+	// and dissasemble the code adjacent to where it segfaults. On the
+	// Jetson Xavier with CUDA 10.2, the assembly is as follows:
+        //   (reg x19 contains cuDeviceGetCount()'s user-provided pointer)
+	//   ...
+	//   0x0000007fb71454b4:  cbz   x19, 0x7fb71454d0 // Check ptr non-zero
+	//   0x0000007fb71454b8:  adrp  x1, 0x7fb7ea6000 // Addr of lookup tbl
+	//   0x0000007fb71454bc:  ldr   x1, [x1,#3672] // Get addr of globals
+	//   0x0000007fb71454c0:  ldr   w1, [x1,#904] // Get count from globals
+	//   0x0000007fb71454c4:  str   w1, [x19] // Store count at user addr
+	//   ...
+	// In this assembly, we can identify that CUDA uses an internal lookup
+	// table to identify the location of the globals structure (pointer
+	// 459 in the table; offset 3672). After obtaining this pointer, it
+	// advances to offset 904 in the global structure, dereferences the
+	// value stored there, and then attempts to store it at the user-
+	// -provided address (register x19). This final line will trigger a
+	// segfault if a non-zero bad address is passed to cuDeviceGetCount().
+	//
+	// On x86_64:
+	//   (reg %rbx contains cuDeviceGetCount()'s user-provided pointer)
+	//   ...
+	//   0x00007ffff6cac01f:  test  %rbx,%rbx // Check ptr non-zero
+	//   0x00007ffff6cac022:  je    0x7ffff6cac038 // ''
+	//   0x00007ffff6cac024:  mov   0x100451d(%rip),%rdx # 0x7ffff7cb0548 // Get globals base address from offset from instruction pointer
+	//   0x00007ffff6cac02b:  mov   0x308(%rdx),%edx // Take globals base address, add an offset of 776, and dereference
+	//   0x00007ffff6cac031:  mov   %edx,(%rbx) // Store count at user addr
+	//   ...
+	// Note that this does not use an intermediate lookup table.
+	//
+	// [Aside: cudbgReportDriverApiErrorFlags is currently the closest
+	// symbol to **the lookup table**. cudbgDebuggerInitialized is closer
+	// to the globals struct itself (+7424 == SM mask control), but we
+	// perfer the table lookup approach for now, as that's what
+	// cuDeviceGetCount() does.]
+
+#if __aarch64__
+	// In my test binary, the lookup table is at address 0x7fb7ea6000, and
+	// this is 1029868 bytes before the address for
+	// cudbgReportDriverApiErrorFlags. Use this information to derive the
+	// location of the lookup in our binary (defeat relocation).
 	uintptr_t* tbl_base = (uintptr_t*)((uintptr_t)sym - 1029868);
-	// Address of `globals` is at offset 3672 (entry 459?)
-	uintptr_t globals_addr = *(tbl_base + 459); // Offset 3672 on aarch64
+	// Address of `globals` is at offset 3672 (entry 459?) in the table
+	uintptr_t globals_addr = *(tbl_base + 459);
 	// SM mask control is at offset 4888 in the `globals` struct
+	// [Device count at offset 904 (0x388)]
 	g_sm_control = (struct global_sm_control*)(globals_addr + 4888);
+#endif // __aarch64__
+#if __x86_64__
+	// In my test binary, globals is at 0x7ffff7cb0548, which is 1103576
+	// bytes before the address for cudbgReportDriverApiErrorFlags
+	// (0x7ffff7dbdc20). Use this offset to defeat relocation.
+	uintptr_t globals_addr = *(uintptr_t*)((uintptr_t)sym - 1103576);
+	// SM mask control is at offset 4728 in the `globals` struct
+	// [Device count at offset 776 (0x308)]
+	g_sm_control = (struct global_sm_control*)(globals_addr + 4728);
+#endif // __x86_64__
 	// SM mask should be empty by default
 	if (g_sm_control->enabled || g_sm_control->mask)
-		fprintf(stderr, "Warning: Found non-NULL SM disable mask during setup! g_sm_control is likely invalid---use at own risk.\n");
+		fprintf(stderr, "Warning: Found non-empty SM disable mask "
+		                "during setup! libsmctrl_set_global_mask() is "
+		                "unlikely to work on this platform!\n");
 }
 
 /*** QMD/TMD-based SM Mask Control via Debug Callback. CUDA 11+ ***/
@@ -119,19 +183,23 @@ static void setup_sm_control_11() {
 		fprintf(stderr, "libsmctrl: Error enabling launch callback. Error %d\n", res);
 }
 
-// Common masking control
+// Set default mask for all launches
 void libsmctrl_set_global_mask(uint64_t mask) {
 	int ver;
 	cuDriverGetVersion(&ver);
-	if (ver <= 10020) {
+	if (ver == 10020) {
 		if (!g_sm_control)
-			setup_sm_control_10();
+			setup_g_sm_control_10();
 		g_sm_control->mask = mask;
 		g_sm_control->enabled = 1;
-	} else {
+	} else if (ver > 10020) {
 		if (!sm_control_setup_called)
 			setup_sm_control_11();
 		g_sm_mask = mask;
+	} else { // < CUDA 10.2
+		abort(1, ENOSYS, "Global masking requires at least CUDA 10.2; "
+		                 "this application is using CUDA %d.%d",
+		                 ver / 1000, (ver % 100));
 	}
 }
 
