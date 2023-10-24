@@ -1,5 +1,5 @@
 /**
- * Copyright 2022 Joshua Bakita
+ * Copyright 2023 Joshua Bakita
  * Library to control TPC masks on CUDA launches. Co-opts preexisting debug
  * logic in the CUDA driver library, and thus requires a build with -lcuda.
  */
@@ -8,26 +8,25 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 /* PARTITIONING FUNCTIONS */
 
 // Set global default TPC mask for all kernels, incl. CUDA-internal ones
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 10.2, and CUDA 11.0 - CUDA 11.8
+// Supported: CUDA 10.2, and CUDA 11.0 - CUDA 12.1
 extern void libsmctrl_set_global_mask(uint64_t mask);
 // Set default TPC mask for all kernels launched via `stream`
 // (overrides global mask)
 // @param stream A cudaStream_t (aka CUstream_st*) to apply the mask on
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 8.0 - CUDA 11.8
+// Supported: CUDA 8.0 - CUDA 12.1
 extern void libsmctrl_set_stream_mask(void* stream, uint64_t mask);
 // Set TPC mask for the next kernel launch from the caller's CPU thread
 // (overrides global and per-stream masks, applies only to next launch).
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 11.0 - CUDA 11.8
+// Supported: CUDA 11.0 - CUDA 12.1
 extern void libsmctrl_set_next_mask(uint64_t mask);
-
-// **DEPRECATED**: Old name for libsmctrl_set_global_mask()
-extern void set_sm_mask(uint64_t mask) __attribute__((deprecated("Use libsmctrl_set_global_mask()")));
 
 /**
  * Notes on Bitmasks
