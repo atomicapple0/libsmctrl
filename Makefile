@@ -6,6 +6,8 @@ LDFLAGS = -lcuda -I/usr/local/cuda/include
 
 .PHONY: clean tests
 
+all: libsmctrl.so libsmctrl.a
+
 libsmctrl.so: libsmctrl.c libsmctrl.h
 	$(CC) $< -shared -o $@ $(CFLAGS) $(LDFLAGS)
 
