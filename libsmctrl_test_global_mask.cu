@@ -5,7 +5,8 @@
 #include <cuda_runtime.h>
 
 #include "libsmctrl.h"
-#include "testbench.h"
+
+#define SAFE(x) x
 
 __global__ void read_and_store_smid(uint8_t* smid_arr) {
   if (threadIdx.x != 1)
@@ -33,7 +34,7 @@ int count_unique(uint8_t* arr, int len) {
 }
 
 int main() {
-  cudaError_t err; // Needed by SAFE() macro
+//   cudaError_t err; // Needed by SAFE() macro
   int res;
   uint8_t *smids_native_d, *smids_native_h;
   uint8_t *smids_partitioned_d, *smids_partitioned_h;
